@@ -256,7 +256,7 @@ template<int D = 2>
 class VivaldiModel {
 private: 
     HistoryStat<EuclideanVector<D> > history_force_stat;
-    int self_id;
+    int self_id; // 节点id
     int history_counter;
     bool enable_IN1;
     bool enable_IN2;

@@ -1,6 +1,8 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <numeric>
+#include <utility>
 #include <vector>
 #include <queue>
 #include <cmath>
@@ -8,7 +10,16 @@
 #include <random>
 #include <memory>
 #include <cstdlib>
+#include <iostream>
+#include <fstream>
+#include <map>
+#include <atomic>
+#include <csignal>
+
 #include "coordinate.h"
+#include "thread_pool.h"
+#include "utils.h"
+
 #define memcle(a) memset(a, 0, sizeof(a))
 
 using namespace std;
@@ -26,24 +37,41 @@ const int INNER_DEG = 4;
 const int MAX_TEST_N = 8000;
 const int MAX_OUTBOUND = 8;
 //typedef unsigned int int;
+int testid = 0;
+/// @brief 节点数
 int n;
 mt19937 rd(1000);
-bool recv_flag[N];
-int recv_parent[N];
-double recv_time[N]; 
-double recv_dist[N]; 
+bool recv_flag[N]; // 节点是否已经接收到该消息
+int recv_parent[N]; // 节点接收到消息的来源
+double recv_time[N]; // 节点接收到消息的具体时间
+double recv_dist[N]; // 节点接收到消息的时间
 int depth[N];
 
-int mal_flag[N];
+int mal_flag[N]; // 恶意节点
 FILE* fig_csv;
 
+
+int recv_step[N]; // 每个节点接收到交易时的交易step
+unordered_map<int ,int> dup_msg_cnts; // 记录在哪一步得到的重复消息
+
+std::atomic<int> unique_message_id(0);
+std::atomic<bool> stop(false);
+const int kPriority = 100;
+const double kAdjustPriority = 0.1;
+double kEighty = 0.8;
+double kNinty = 0.9;
+
+std::atomic<double> bandwith(0.0);
+std::atomic<double> latency(0.0);
+
+typedef SafeQueue<std::future<TestResult>> TestResultQueue;
 
 // coordinate, using longitude and latitude
 class LatLonCoordinate {
   public:
     double lat, lon;
 };
-
+/// @brief 经纬度坐标集合
 LatLonCoordinate coord[N];
 
 // from degree to radian 
@@ -67,7 +95,6 @@ class message {
 
     message(int _root, int _src, int _dst, int _step, double _send_time, double _recv_time) : 
         root(_root), src(_src), dst(_dst), step(_step), send_time(_send_time), recv_time(_recv_time) {
-
     }
 
     void print_info() {
@@ -80,10 +107,162 @@ bool operator>(const message &a, const message &b) {
     return a.recv_time > b.recv_time;
 }
 
+class Message {
+ public:
+    Message(int id, int root, int src, int dst, int step, double send_time, double recv_time) :
+            id_(id), root_(root),  src_(src), dst_(dst), step_(step), send_time_(send_time), recv_time_(recv_time) {}
+    
+    int GetStep() { return step_; }
+    
+    void AddStep(int step) {
+        step_ += step;
+    }
+
+    int GetSrc() { return src_; }
+
+    int GetDst() { return dst_; }
+
+    int GetId() { return id_; }
+
+    double GetRecvTime() const { return recv_time_; }
+    
+    bool operator>(const Message& other) const {
+        return recv_time_ > other.GetRecvTime();
+    }
+
+ private:
+    int id_;
+    int root_;
+    int src_, dst_, step_;
+    double send_time_, recv_time_;
+};
+
+struct OutNode {
+    int node_id;
+    int priority = kPriority;
+    int duplicate_msgs = 0;
+    int received_msgs = 0;
+};
+
+class Node {
+ public:
+    Node(int id) : id_(id) {}
+
+    vector<int> GetRelayList(int relay_cnts) {
+        vector<int> rets;
+        rets.reserve(relay_cnts);
+        for (auto node : outbounds_) {
+            if (relay_cnts-- <= 0) {
+                break;
+            }
+            rets.push_back(node.first);
+        }
+        return rets;
+    }
+
+    int GetId() const { return id_; }
+
+    bool IsRelay(int msg_id) const {
+        return recv_msgs_.find(msg_id) != recv_msgs_.end();
+    }
+
+    static bool PriorityCompare(const OutNode& a, const OutNode& b) {
+        return a.priority < b.priority;
+    }
+
+    void SetNodePriority(std::shared_ptr<Node> node, int priority) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        int node_id = node->GetId();
+
+        auto find_node = FindNode(node_id);
+        if (find_node != nullptr)
+        {
+            find_node->priority = priority;
+        }
+        std::sort(outnodes_.begin(), outnodes_.end(), PriorityCompare);
+    }
+
+    void ReceiveMsg(Message& msg, std::shared_ptr<Node> src, std::shared_ptr<Node> dst) {
+        recv_msgs_.insert(msg.GetId());
+        if (src->GetId() == dst->GetId()) {
+            return;
+        }
+        auto out = src->FindNode(msg.GetDst());
+        ++out->received_msgs;
+    }
+
+    OutNode* FindNode(int node_id) {
+        for (auto& node : outnodes_) {
+            if (node_id == node.node_id) {
+                return &node;
+            }
+        }
+        return nullptr;
+    }
+
+    void Connect(OutNode&& out_node) {
+        outnodes_.push_back(out_node);
+        std::sort(outnodes_.begin(), outnodes_.end(), PriorityCompare);
+    }
+
+    map<int, OutNode> GetOutbounds() { return outbounds_; }
+
+    std::vector<OutNode> GetOutNodes() { return outnodes_; }
+
+ private:
+    int id_;
+    unordered_set<int> recv_msgs_; // 接收到的消息ID
+    // map<Node*, int, compare> outbounds_; // kv: (node, priority)
+    map<int, OutNode> outbounds_; // (node_id, priority)
+    std::vector<OutNode> outnodes_;
+    std::mutex mutex_;
+};
+
+// 邻接表
+class Graph {
+ public:
+    explicit Graph(int n) {
+        for (int i = 0; i < n; i++) {
+            auto node = std::make_shared<Node>(i);
+            out_bound_.push_back(node);
+
+        }
+    }
+
+    bool AddEdge(int u, int v) {
+        if (u == v) {
+            return false;
+        }
+
+        auto v_node = out_bound_[u]->FindNode(v);
+        if (v_node != nullptr) {
+            return false;
+        }
+
+        OutNode* out_node = new OutNode();
+        out_node->node_id = v;
+        out_bound_[u]->Connect(std::move(*out_node));
+        return true;
+    }
+
+    std::vector<OutNode> GetOutBound(int src) {
+        auto bounds = out_bound_[src]->GetOutNodes();
+        return bounds;
+    }
+
+    std::shared_ptr<Node> GetNode(int node_id) {
+        return out_bound_[node_id];
+    }
+
+ private:
+    vector<std::shared_ptr<Node>> out_bound_;
+};
+
 class graph {
   public:
     vector<int> in_bound[N];
     vector<int> out_bound[N];
+    vector<pair<int, int>> new_out_bound[N]; // 连接节点，以及对应节点的优先级
     int n; 
     int m;
 
@@ -125,6 +304,10 @@ class graph {
             }
     }
 
+    vector<pair<int, int>> new_outbound(int src) {
+        auto v = new_outbound(src);
+        return v;
+    }
     vector<int> outbound(int u) {
         auto v = out_bound[u];
         return v;
@@ -167,6 +350,211 @@ class basic_algo {
     //static const char* get_algo_name();
 };
 
+class BasicAlgorithm {
+ public:
+    virtual vector<int> Response(Message msg) {}
+    virtual void SetRoot(int root) {}
+    virtual void ProcessDupMsg(std::shared_ptr<Node> src_node,  std::shared_ptr<Node> dst_node) {}
+    virtual void Statistical(TestResult& result) {}
+    virtual void ShowStatistical() {}
+
+    virtual std::shared_ptr<Node> GetNode(int node_id) {}
+
+    void AddNormal(int cnts) { normal_msgs_.fetch_add(cnts); }
+    void AddDup(int cnts) { dup_msgs_.fetch_add(cnts); }
+
+    long long GetNormal() { return normal_msgs_.load(); }
+    long long GetDup() { return dup_msgs_.load(); }
+    long long GetTotalMsg() { return normal_msgs_.load() + dup_msgs_.load(); }
+
+    long long CalVarintPercentage(std::vector<long>& sequence, double percentage) {
+        if (percentage > 1) {
+            return -1;
+        }
+        
+        int sz = sequence.size();
+        int index = sz * percentage;
+        return sz == index ? sequence[index - 1] : sequence[index];
+    };
+
+    void Init() {
+        normal_msgs_.store(0);
+        dup_msgs_.store(0);
+    }
+
+ private:
+    std::atomic<long long> normal_msgs_{0};
+    std::atomic<long long> dup_msgs_{0};
+};
+
+
+template <int fanout = FANOUT>
+class BestRelay : public BasicAlgorithm {
+ public:
+    BestRelay(int n, LatLonCoordinate* /* coord */, int /*root*/) {
+        G = std::move(std::make_unique<Graph>(n));
+        for (int src = 0; src < n; src++) {
+            for (int k = 0; k < fanout; k++) {
+                int dst = random_num(n);
+                while (G->AddEdge(src, dst) == false) {
+                    dst = random_num(n);
+                }
+            }
+        }
+    }
+  // 返回转发的节点
+  vector<int> Response(Message msg) override {
+    
+    auto relay_cnts = RelayNodeCnts(msg.GetStep());
+    auto src = G->GetNode(msg.GetDst());
+
+    vector<int> dsts;
+    for (auto& node : src->GetOutNodes()) {
+        if (relay_cnts-- < 0) {
+            break;
+        }
+        dsts.push_back(node.node_id);
+    }
+    return dsts;
+  }
+
+  // 调整出度节点的优先级
+  void ProcessDupMsg(std::shared_ptr<Node> src_node,  std::shared_ptr<Node> dst_node) override {
+    int out_node_id = dst_node->GetId();
+    auto out_node = src_node->FindNode(out_node_id);
+    if (out_node == nullptr) {
+        return;
+    }
+    ++out_node->duplicate_msgs;
+    // 根据接受消息和重复消息的比例改变节点转发优先级
+    if (out_node->received_msgs == 0) {
+        return;
+    }
+
+    if (static_cast<double>(out_node->duplicate_msgs) / out_node->received_msgs > kAdjustPriority) {
+        src_node->SetNodePriority(dst_node, --out_node->priority);
+    }
+  }
+
+  // 根据message传播步数，计算转发的节点数量
+  int RelayNodeCnts(int step) {
+    if (step <= 2) {
+        return FANOUT;
+    }
+
+    return std::max(Log(step), 2);
+  }
+
+  std::shared_ptr<Node> GetNode(int node_id) {
+    return G->GetNode(node_id);
+  }
+
+  void Statistical(TestResult& result) override {
+    auto avg_latency = result.GetReceiveTime() / result.GetReceiveNode();
+     auto sequence = result.GetSequence();
+     std::sort(sequence.begin(), sequence.end());
+    varint_percentage_.Eighty = CalVarintPercentage(sequence, kEighty);
+    varint_percentage_.Ninty = CalVarintPercentage(sequence, kNinty);
+    varint_percentage_.All = CalVarintPercentage(sequence, 1.0);
+    if (statistic_data_.size() > 100) {
+        statistic_data_.pop();
+    }
+    statistic_data_.push({statistic_cnts++, avg_latency});
+  }
+
+    void ShowStatistical() override {
+        std::cout << "*** " << algo_name << " ***" << std::endl;
+        double total_latency = 0;
+        int simulate_cnts = statistic_data_.size();
+        while (!statistic_data_.empty()) {
+            total_latency += statistic_data_.top().second;
+            statistic_data_.pop();
+        }
+        std::cout << "avg_latency: " << std::fixed << 
+        total_latency / simulate_cnts << ", avg_bandwith: " 
+        << static_cast<double>(GetNormal() + GetDup()) / GetNormal() << std::endl;
+
+        std::cout << varint_percentage_ << std::endl;
+    }
+
+private:
+  std::unique_ptr<Graph> G;
+  static constexpr const char *algo_name = "best_relay";
+  VarintPercentage varint_percentage_;
+  std::priority_queue<std::pair<int, double>>statistic_data_;
+  int statistic_cnts = 0;
+  static bool compare(pair<int, int> &a, pair<int, int> &b) {
+    return a.second > b.second;
+  }
+
+  // n为底，m的对数
+  int Log(int m, double n = 0.5) {
+    return std::log(m) / std::log(n) + FANOUT;
+  }
+
+};
+
+template <int root_fanout = ROOT_FANOUT, int second_fanout = SECOND_FANOUT, int fanout = FANOUT>
+class RandomFlood : public BasicAlgorithm {
+ public:
+    RandomFlood(int n, LatLonCoordinate* /* coord */, int /* root */) {
+        G = std::move(std::make_unique<Graph>(n));
+        for (int src = 0; src < n; src++) {
+            for (int k = 0; k < fanout; k++) {
+                int dst = random_num(n);
+                while (G->AddEdge(src, dst) == false) {
+                    dst = random_num(n);
+                }
+            }
+        }
+    }
+
+    vector<int> Response(Message msg) override {
+        int u = msg.GetDst();
+
+        vector<int> ret;
+        auto outbound = G->GetOutBound(u);
+        for (auto& node : outbound) {
+            if (node.node_id != msg.GetSrc()) {
+                ret.push_back(node.node_id);
+            }
+        }
+        return ret;
+    }
+
+    std::shared_ptr<Node> GetNode(int node_id) {
+        return G->GetNode(node_id);
+    }
+
+    void Statistical(TestResult& result) override {
+        auto avg_latency = result.GetReceiveTime() / result.GetReceiveNode();
+        auto sequence = result.GetSequence();
+        std::sort(sequence.begin(), sequence.end());
+        varint_percentage_.Eighty = CalVarintPercentage(sequence, kEighty);
+        varint_percentage_.Ninty = CalVarintPercentage(sequence, kNinty);
+        varint_percentage_.All = CalVarintPercentage(sequence, 1.0);
+        statistic_data_.push_back(avg_latency);
+    }
+
+    void ShowStatistical() override {
+        if (statistic_data_.empty()) {
+            return;
+        }
+        std::cout << "*** " << algo_name << " ***" << std::endl;
+        std::cout << "avg_latency: " << std::fixed << 
+        std::accumulate(statistic_data_.begin(), statistic_data_.end(), 0) / statistic_data_.size() 
+        << ", avg_bandwith: " << static_cast<double>(GetNormal() + GetDup()) / GetNormal() << std::endl;
+        std::cout << varint_percentage_ << std::endl;
+    }
+
+ private:
+    std::unique_ptr<Graph> G;
+    static constexpr const char* algo_name = "random_flood";
+    int tree_root;
+    std::vector<double> statistic_data_;
+    VarintPercentage varint_percentage_;
+};
+
 template<int root_fanout = ROOT_FANOUT, int second_fanout = SECOND_FANOUT, int fanout = FANOUT>
 class random_flood : public basic_algo {
 
@@ -178,7 +566,6 @@ class random_flood : public basic_algo {
     graph G; // random graph
     static constexpr const char* algo_name = "random_flood";
     int tree_root;
-
   public:
     const static bool specified_root = true;
     random_flood(int n, LatLonCoordinate *coord, int root = 0) : G(n) {
@@ -220,6 +607,7 @@ class random_flood : public basic_algo {
     void print_info() {
         G.print_info();
     }
+    static int get_fanout() {return root_fanout;}
 };
 
 // the difference of lontitudes should be in the range of [-180, 180]
@@ -323,6 +711,7 @@ class static_build_tree : public basic_algo {
 
 const static int D = 3;
 const static int COORDINATE_UPDATE_ROUND = 100;
+/// @brief vivalModel集合，一个节点对应一个vivalModel
 VivaldiModel<D> vivaldi_model[N];
 
 void generate_random_virtual_coordinate() {
@@ -334,14 +723,15 @@ void generate_random_virtual_coordinate() {
 }
 
 void generate_virtual_coordinate() {
-    // init
+    // init，为每个vivaldiModel标号
     for (int i = 0; i < n; i++)
         vivaldi_model[i] = VivaldiModel<D>(i);
-    
+    // 100轮更新达到坐标稳定
     for (int round = 0; round < COORDINATE_UPDATE_ROUND; round++) {
         //printf("%d\n", round);
         for (int x = 0; x < n; x++) {
             vector<int> selected_neighbor;
+            // 随机选择邻居节点
             if (vivaldi_model[x].have_enough_peer) {
                 for (auto &y: vivaldi_model[x].random_peer_set)
                     selected_neighbor.push_back(y);
@@ -355,6 +745,7 @@ void generate_virtual_coordinate() {
 
             for (auto y: selected_neighbor)
             {
+                // 根据与邻居节点的距离更新自身坐标
                 double rtt = distance(coord[x], coord[y]) + FIXED_DELAY;
                 vivaldi_model[x].observe(y, vivaldi_model[y].coordinate(), rtt);
             }
@@ -443,7 +834,7 @@ void k_means_based_on_virtual_coordinate() {
     EuclideanVector<D> center[K];
     EuclideanVector<D> avg[K];
     vector<int> tmp_list;
-
+    // 随机选择K个中心点
     for (int i = 0; i < K; i++) {
         while (true) {
             int u = random_num(n);
@@ -458,7 +849,7 @@ void k_means_based_on_virtual_coordinate() {
     // K means
     for (int iter = 0; iter < max_iter; iter++) {
 
-        // find the nearest center
+        // find the nearest center，根据节点与每个cluster中心点的距离将每个节点聚类到每个cluster
         for (int i = 0; i < n; i++) {
             double dist = 1e100;
             int cur_cluster = 0;
@@ -499,9 +890,34 @@ void k_means_based_on_virtual_coordinate() {
     printf("\n");
 }
 
+/// @brief 输出step数据到指定文件
+/// @param output_filename 
+void write_steps_data(string output_filename) {
+    ofstream outfile;
+    outfile.open(output_filename, ios::out);
 
-
-
+    for (int i=0; i<n; i++) {
+        if (!recv_step[i]) continue;
+        outfile << recv_step[i] << endl;
+    }
+    outfile << "---end---" << endl;
+    outfile.close();
+}
+void write_dupmsg(string output_file = "dupmsg.dt") {
+    ofstream outfile;
+    outfile.open(output_file);
+    for (auto [step, cnts] : dup_msg_cnts) {
+        outfile << step << " " << cnts << endl;
+    }
+    outfile << "---end---" << endl;
+    outfile.close();
+}
+/// @brief 
+/// @tparam root_fanout 128 
+/// @tparam second_fanout 8
+/// @tparam fanout 8
+/// @tparam enable_nearest true 
+/// @tparam worst_attack 
 template <int root_fanout = ROOT_FANOUT, int second_fanout = SECOND_FANOUT, int fanout = FANOUT, bool enable_nearest = false, bool worst_attack = false>
 class k_means_cluster : public basic_algo {
 // k_means_cluster:
@@ -524,7 +940,7 @@ class k_means_cluster : public basic_algo {
             int c = cluster_result[i];
             // 4 out_bound in the same cluster
             int inner_deg = INNER_DEG;
-
+            // 随机选取4个同一集群中的节点连接
             if (vivaldi_model[i].coordinate().error() < 0.4) {
                 if (cluster_cnt[c] <= inner_deg + 1) {
                     for (int j : cluster_list[c])
@@ -555,7 +971,7 @@ class k_means_cluster : public basic_algo {
 
             }
 
-            // build the near graph
+            // build the near graph 每个节点与所在集群中最近的4个节点相连
             if (vivaldi_model[i].coordinate().error() < 0.4) {
                 vector<pair<double, int> > nearest_peer;
                 for (int j : cluster_list[c]) {
@@ -587,7 +1003,7 @@ class k_means_cluster : public basic_algo {
         vector<int> nb_u = G.outbound(u);
         vector<int> ret;
 
-
+        // 消息来自别的集群或者刚由客户端发出
         if (enable_nearest && (cluster_result[msg.src] != cluster_result[u] || msg.step == 0 || msg.recv_time - msg.send_time > 100)) {
             int cnt = 0;
             for (auto v : G_near.out_bound[u]) {
@@ -614,6 +1030,13 @@ class k_means_cluster : public basic_algo {
         } else {
             remain_deg = fanout - ret.size();
         }
+
+        // if (msg.step == 0) {
+        //     remain_deg = root_fanout - ret.size();
+        // } else {
+        //     // remain_deg = root_fanout / (msg.step + second_fanout * 2 + 2) - ret.size();
+        //     remain_deg = root_fanout / (second_fanout * 2 + log2(msg.step)) - ret.size();
+        // }
 
         // !!!!!!!!!!!!!!!!!
         // If worst_attack happens, we assume all the peer selection related to distance/coordinate/clustering fails
@@ -1007,17 +1430,20 @@ test_result single_root_simulation(int root, int rept_time, double mal_node, sha
         algo.reset(new algo_T(n, coord, root));
     }
     algo -> set_root(root);
-
+    
+    FILE* dupOutput = fopen("dup_ouput.txt", "a");
     for (int rept = 0; rept < rept_time; rept++)  {
 
         priority_queue<message, vector<message>, greater<message> > msg_queue;
         msg_queue.push(message(root, root, root, 0, 0, 0)); // initial message
 
+        memcle(recv_step);
         memcle(recv_flag);
         memcle(recv_time);
         memcle(recv_dist);
         memset(recv_parent, -1, sizeof(recv_parent));
         memcle(depth);
+        dup_msg_cnts.clear();
         vector<int> recv_list;
 
         int dup_msg = 0;
@@ -1032,9 +1458,12 @@ test_result single_root_simulation(int root, int rept_time, double mal_node, sha
             // duplicate msg -- ignore
             if (recv_flag[u] == true) {
                 dup_msg++;
+                dup_msg_cnts[msg.step + 1]++;
                 continue;
             }
             //msg.print_info();
+            if (msg.step == 0) cout << msg.step << endl;
+            recv_step[u] = msg.step + 1; // 记录节点在第几步接收到交易
 
             recv_flag[u] = true;
             recv_time[u] = msg.recv_time;
@@ -1042,12 +1471,12 @@ test_result single_root_simulation(int root, int rept_time, double mal_node, sha
             recv_parent[u] = msg.src;
             recv_list.push_back(u);
             if (u != root)
-                depth[u] = depth[msg.src] + 1;
+                depth[u] = depth[msg.src] + 1; 
 
             // malicious node -- no response
             if (mal_flag[u] == true) continue;
 
-            auto relay_list = (*algo).respond(msg);
+            auto relay_list = (*algo).respond(msg); // 计算转发交易节点列表
 
             double delay_time = (FIXED_DELAY - 50) + std::min(std::max(rand_latency(generator), 0.0), 100.0);  // avg is 250ms, in simulation: make it 200ms + Gaussian(50, 10)
             for (auto v: relay_list) {
@@ -1059,6 +1488,12 @@ test_result single_root_simulation(int root, int rept_time, double mal_node, sha
                 msg_queue.push(new_msg);
             }
         }
+        fprintf(dupOutput, "dupMsg %d at %d test\n", dup_msg, testid++);
+        // write_steps_data("normal_stepdata.dt");
+        write_steps_data("less_stepdata.dt");
+
+        if (algo_T::get_algo_name() == "random_flood")
+        write_dupmsg(to_string(algo_T::get_fanout()));
 
         int cluster_recv_count[10];
         memcle(cluster_recv_count);
@@ -1082,7 +1517,7 @@ test_result single_root_simulation(int root, int rept_time, double mal_node, sha
                 result.cluster_avg_latency[c] += recv_time[i];
             }
 
-        avg_latency /= recv_count;
+        avg_latency /= recv_count; // 平均延迟 = 所有节点接收到该msg的时间之和 / 节点数
         for (int c = 0; c < K; c++) {
             result.cluster_avg_depth[c] /= cluster_recv_count[c];
             result.cluster_avg_latency[c] /= cluster_recv_count[c];
@@ -1090,7 +1525,7 @@ test_result single_root_simulation(int root, int rept_time, double mal_node, sha
 
 
         int non_mal_node = recv_list.size();
-        result.avg_bnd += (double(dup_msg + non_mal_node) / (non_mal_node));
+        result.avg_bnd += (double(dup_msg + non_mal_node) / (non_mal_node)); // 平均带宽 = (重复消息数 + 正常节点数) / 正常节点数
         int depth_cnt[100];
         memcle(depth_cnt);
 
@@ -1115,7 +1550,7 @@ test_result single_root_simulation(int root, int rept_time, double mal_node, sha
 
     }
 
-
+    fclose(dupOutput);
     result.avg_bnd /= rept_time; 
     for (int i = 0; i < MAX_DEPTH; i++) 
         result.depth_cdf[i] /= rept_time; 
@@ -1147,6 +1582,58 @@ test_result single_root_simulation(int root, int rept_time, double mal_node, sha
               
     return result;
 }
+
+// 一个消息传播全网
+template <class algo_T>
+TestResult Simulation(int root, int rept_time, shared_ptr<algo_T> algo) {
+    TestResult result;
+    std::default_random_engine generator;
+    std::normal_distribution<double> rand_latency(50.0, 10.0);
+
+    for (int rept = 0; rept < rept_time; rept++) {
+        priority_queue<Message, vector<Message>, greater<Message>> msg_queue;
+        int msg_id = unique_message_id.load();
+        unique_message_id.fetch_add(1);
+        msg_queue.push(Message(msg_id, root, root, root, 0, 0, 0));
+
+        algo->Init();
+
+        while (!msg_queue.empty()) {
+            auto msg = msg_queue.top();
+            msg_queue.pop();
+            auto msg_id = msg.GetId();
+            auto cur_node = algo->GetNode(msg.GetDst());
+            auto src_node=  algo->GetNode(msg.GetSrc());
+            auto cur_nodeId = cur_node->GetId();
+
+            if (cur_node->IsRelay(msg_id)) {
+                algo->AddDup(1);
+                if (std::is_same_v<algo_T, BestRelay<>>) {
+                    algo->ProcessDupMsg(src_node, cur_node);
+                }
+                continue;
+            }
+
+            algo->AddNormal(1);
+
+            cur_node->ReceiveMsg(msg, src_node, cur_node);
+
+            result.AddReceiveNode(1);
+            result.AddReceiveTime(msg.GetRecvTime(), algo->GetTotalMsg());
+
+            auto relay_list = algo->Response(msg);
+            double delay_time = (FIXED_DELAY - 50) + std::min(std::max(rand_latency(generator), 0.0), 100.0);
+            for (auto relay_node : relay_list) {
+                double dist = distance(coord[cur_nodeId], coord[relay_node]) * 3;
+                Message new_msg = Message(msg_id, root, cur_nodeId, relay_node, msg.GetStep() + 1, msg.GetRecvTime() + delay_time, msg.GetRecvTime() + dist + delay_time);
+                msg_queue.push(new_msg);
+            }
+        }
+
+    }
+    return result; 
+}
+
 
 template <class algo_T>
 test_result simulation(int rept_time = 1, double mal_node = 0.0) {
@@ -1335,20 +1822,150 @@ void init() {
     fclose(f);
 }
 
+template <class algo_T>
+void Submit(ThreadPool& net, shared_ptr<algo_T> algo, SafeQueue<std::future<TestResult>>& queue) {
+    int root = random_num(n);
+    auto result = net.Submit(Simulation<algo_T>, root, 1, algo);
+    queue.Push(std::move(result));
+}
+
+template<>
+void Submit(ThreadPool& net, shared_ptr<RandomFlood<>> algo, SafeQueue<std::future<TestResult>>& queue) {
+    int root = random_num(n);
+    auto result = net.Submit(Simulation<RandomFlood<>>, root, 1, algo);
+    queue.Push(std::move(result));
+}
+
+template<>
+void Submit(ThreadPool& net, shared_ptr<BestRelay<>> algo, SafeQueue<std::future<TestResult>>& queue) {
+    int root = random_num(n);
+    auto result = net.Submit(Simulation<BestRelay<>>, root, 1, algo);
+    queue.Push(std::move(result));
+}
+
+template<class algo_T>
+void RunOneAlgorithm(std::shared_ptr<algo_T> algo, ThreadPool& net,
+                    std::vector<std::thread>& result_threads,
+                    std::vector<std::thread>& algo_threads,
+                    TestResultQueue& result_queue) {
+    result_threads.emplace_back(
+        [&result_queue, &algo]{
+            std::future<TestResult> fu;
+            while (!stop.load()) {
+                if (result_queue.Pop(fu)) {
+                    auto result = fu.get();
+                    algo->Statistical(result);
+                }
+            }
+        }
+    );
+
+    algo_threads.emplace_back(
+        [&algo, &net, &result_queue]{
+            while (!stop.load()) {
+                Submit<algo_T>(net, algo, result_queue);
+            }
+        }
+    );
+
+
+}
+
+void Stop(int signal) {
+    std::cout << "Stop..." << std::endl;
+    stop.store(true);
+}
+
 int main() {
-    int rept = 10;
-    double mal_node = 0.00;
-    init();
+    init(); // 读入经纬度坐标
+    std::signal(SIGINT, Stop);
+
+    std::vector<std::shared_ptr<BasicAlgorithm>> algos;
+    std::vector<thread> result_threads;
+    std::vector<thread> algo_threads;
+    std::vector<std::shared_ptr<TestResultQueue>> result_queues;
+
+    ThreadPool net(3);
+    TestResultQueue result_queue;
+
+    auto best_relay = std::make_shared<BestRelay<>>(n, nullptr, 0);
+    // auto random = std::make_shared<RandomFlood<>>(n, nullptr, 0);
+
+    std::thread result_thread([&result_queue, &best_relay](){
+        std::future<TestResult> fu;
+        while (!stop) {
+            if (result_queue.Pop(fu)) {
+                auto res = fu.get();
+                best_relay->Statistical(res);
+            }
+        }
+    });
+
+    // std::thread result_thread([&result_queue, &random](){
+    //     std::future<TestResult> fu;
+    //     while (!stop) {
+    //         if (result_queue.Pop(fu)) {
+    //             auto res = fu.get();
+    //             random->Statistical(res);
+    //         }
+    //     }
+    // });
+
+    while (!stop) {
+        Submit<BestRelay<8>>(net, best_relay, result_queue);
+        // Submit<RandomFlood<>>(net, random, result_queue);
+    }
+
+    while (!stop) {
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+    }
+
+    net.Stop();
+
+    result_thread.join();
+
+    best_relay->ShowStatistical();
+    // random->ShowStatistical();
+
+
+    /*
+    auto best_relay = std::make_shared<BestRelay<>>(n, nullptr, 0); // todo: 运行30s，统计结果
+    auto random_flood = std::make_shared<RandomFlood<>>(n, nullptr, 0);
+
+    for (int i = 0; i < 2; i++) {
+        result_queues.emplace_back(std::make_shared<TestResultQueue>());
+    }
+
+    RunOneAlgorithm<BestRelay<>>(best_relay, net, result_threads, algo_threads, *result_queues[0]);
+    RunOneAlgorithm<RandomFlood<>>(random_flood, net, result_threads, algo_threads, *result_queues[1]);
+
+    for (auto& th : result_threads) {
+        if (th.joinable()) {
+            th.join();
+        }
+    }
+
+    for (auto& th : algo_threads) {
+        if (th.joinable()) {
+            th.join();
+        }
+    }
+
+    net.Stop();
+
+    for (auto algo : algos) {
+        algo->ShowStatistical();
+    } */
 
     //MERCURY
-    generate_virtual_coordinate();
-    k_means_based_on_virtual_coordinate();
-    simulation<k_means_cluster<128, 8, 8, true> >(rept, mal_node);
+    // generate_virtual_coordinate();
+    // k_means_based_on_virtual_coordinate();
+    // simulation<k_means_cluster<128, 8, 8, true> >(rept, mal_node);
     //MERCURYCLUSTER(with the early outburset optimization disabled)
-    //simulation<k_means_cluster<8, 8, 8, true> >(rept, mal_node);
+    // simulation<k_means_cluster<8, 8, 8, true> >(rept, mal_node);
 
     //RANDOM
-    //simulation<random_flood<8, 8, 8> >(rept, mal_node);
+    // simulation<random_flood<8, 8, 8> >(rept, mal_node);
 
     //Perigee
     //simulation<perigee_ubc<6, 6, 8> >(rept, mal_node);
@@ -1356,7 +1973,6 @@ int main() {
     //BlockP2P
     //k_means();
     //simulation<block_p2p<8> >(rept, mal_node);
-
 
     return 0;
 }
