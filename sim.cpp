@@ -1489,8 +1489,8 @@ test_result single_root_simulation(int root, int rept_time, double mal_node, sha
             }
         }
         fprintf(dupOutput, "dupMsg %d at %d test\n", dup_msg, testid++);
-        // write_steps_data("normal_stepdata.dt");
-        write_steps_data("less_stepdata.dt");
+        write_steps_data("normal_stepdata.dt");
+        // write_steps_data("less_stepdata.dt");
 
         if (algo_T::get_algo_name() == "random_flood")
         write_dupmsg(to_string(algo_T::get_fanout()));
@@ -1885,21 +1885,21 @@ int main() {
     std::vector<thread> algo_threads;
     std::vector<std::shared_ptr<TestResultQueue>> result_queues;
 
-    ThreadPool net(3);
+    // ThreadPool net(3);
     TestResultQueue result_queue;
 
-    auto best_relay = std::make_shared<BestRelay<>>(n, nullptr, 0);
+    // auto best_relay = std::make_shared<BestRelay<>>(n, nullptr, 0);
     // auto random = std::make_shared<RandomFlood<>>(n, nullptr, 0);
 
-    std::thread result_thread([&result_queue, &best_relay](){
-        std::future<TestResult> fu;
-        while (!stop) {
-            if (result_queue.Pop(fu)) {
-                auto res = fu.get();
-                best_relay->Statistical(res);
-            }
-        }
-    });
+    // std::thread result_thread([&result_queue, &best_relay](){
+    //     std::future<TestResult> fu;
+    //     while (!stop) {
+    //         if (result_queue.Pop(fu)) {
+    //             auto res = fu.get();
+    //             best_relay->Statistical(res);
+    //         }
+    //     }
+    // });
 
     // std::thread result_thread([&result_queue, &random](){
     //     std::future<TestResult> fu;
@@ -1911,20 +1911,20 @@ int main() {
     //     }
     // });
 
-    while (!stop) {
-        Submit<BestRelay<8>>(net, best_relay, result_queue);
-        // Submit<RandomFlood<>>(net, random, result_queue);
-    }
+    // while (!stop) {
+    //     Submit<BestRelay<8>>(net, best_relay, result_queue);
+    //     // Submit<RandomFlood<>>(net, random, result_queue);
+    // }
 
-    while (!stop) {
-        std::this_thread::sleep_for(std::chrono::seconds(3));
-    }
+    // while (!stop) {
+    //     std::this_thread::sleep_for(std::chrono::seconds(3));
+    // }
 
-    net.Stop();
+    // net.Stop();
 
-    result_thread.join();
+    // result_thread.join();
 
-    best_relay->ShowStatistical();
+    // best_relay->ShowStatistical();
     // random->ShowStatistical();
 
 
@@ -1957,6 +1957,8 @@ int main() {
         algo->ShowStatistical();
     } */
 
+    int rept = 10;
+    double mal_node = 0.00;
     //MERCURY
     // generate_virtual_coordinate();
     // k_means_based_on_virtual_coordinate();
@@ -1965,7 +1967,7 @@ int main() {
     // simulation<k_means_cluster<8, 8, 8, true> >(rept, mal_node);
 
     //RANDOM
-    // simulation<random_flood<8, 8, 8> >(rept, mal_node);
+    simulation<random_flood<128, 8, 8> >(rept, mal_node);
 
     //Perigee
     //simulation<perigee_ubc<6, 6, 8> >(rept, mal_node);

@@ -36,7 +36,7 @@ def read_data():
         step_datas.append(step_data)
         
 # dupmsgs_file = ['random_flood', 'cluster']
-dupmsgs_file = ['8', '20']
+dupmsgs_file = ['4', '128']
 dup_cdf = ['less','cluster']
 dupmsgs = []
 def read_dupmsgs():
@@ -105,7 +105,7 @@ for i in range(len(step_datas)):
 # # plt.plot(x,y, marker="o",label="PMF")
 # plt.plot(x,cdf,marker="o",label="CDF")
 # plt.axis('off')
-plt.xlim(1,13)
+# plt.xlim(1,15)
 plt.ylim(0,1.5)
 plt.xlabel("hop")
 plt.ylabel("node cover ratio")

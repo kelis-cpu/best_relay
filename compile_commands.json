@@ -1,0 +1,20 @@
+[
+  {
+    "arguments": [
+      "/usr/bin/g++",
+      "-c",
+      "-g",
+      "-Wall",
+      "-std=c++17",
+      "-mpopcnt",
+      "-march=native",
+      "-pthread",
+      "-o",
+      "sim",
+      "sim.cpp"
+    ],
+    "directory": "/home/kelise/best_relay",
+    "file": "/home/kelise/best_relay/sim.cpp",
+    "output": "/home/kelise/best_relay/sim"
+  }
+]
